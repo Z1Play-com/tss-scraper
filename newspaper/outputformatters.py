@@ -22,6 +22,212 @@ log = logging.getLogger(__name__)
 WHITESPACE_CHARS = "\n\r\t " + "\u00a0" + "\ufeff"
 MAX_PARAGRAPH_BEFORE_TITLE = 200
 
+# ---------------------------------------------------------------------------
+# Markdown conversion helpers
+# ---------------------------------------------------------------------------
+
+# Elements to strip before markdown conversion (boilerplate, ads, related
+# articles, social widgets, etc.).  Ordered from most-specific to least.
+_MD_REMOVE_SELECTORS = [
+    "script", "style", "noscript", "iframe",
+    "nav", "header", "footer",
+    '[type="RelatedOneNews"]',          # tuoitre.vn related box
+    'table.article',                    # znews.vn inline related-article tables
+    '[class*="inner-article"]',
+    '[class*="related"]', '[id*="related"]',
+    '[class*="recommend"]', '[id*="recommend"]',
+    '[class*="read-more"]', '[class*="readmore"]',
+    '[class*="news-relation"]',         # techz.vn related box
+    '[id="original_link"]',             # techz.vn source link box
+    '[class*="notebox"]',
+    '[class*="social"]', '[class*="share"]',
+    '[class*="follow"]', '[class*="subscribe"]',
+    '[class*=" ad "]', '[class*="advertisement"]',
+    '[class*="promo"]', '[id*="promo"]',
+    '[class*="comment"]', '[id*="comment"]',
+    '[class*="newsletter"]', '[id*="newsletter"]',
+]
+
+# Ordered list of selectors to locate the main article body container.
+# More specific selectors first; generic "article" tag is last resort.
+_MD_BODY_SELECTORS = [
+    '[itemprop="articleBody"]',
+    '[data-role="content"]',
+    '[class*="article-body"]',
+    '[class*="article-content"]',
+    '[id*="article-body"]',
+    '[id*="article-content"]',
+    '[class*="post-content"]',
+    '[class*="entry-content"]',
+    '[class*="detail-content"]',
+    '[class*="entry-body"]',
+    "article",
+]
+
+
+def build_markdown(raw_html: str) -> str:
+    """Convert a raw article page HTML string to clean Markdown with images,
+    videos and inline captions.
+
+    Strategy:
+    1. Locate the article body container using common CSS selectors.
+    2. Strip non-content boilerplate (ads, related articles, social widgets…).
+    3. Pre-process site-specific media elements before conversion:
+       - ``figure.video`` → ``<figure>`` with ``<img>`` (thumbnail) and
+         ``<figcaption>`` (video caption / title).
+       - ``table.picture`` → ``<figure>`` with ``<img>`` and ``<figcaption>``.
+       - Lazy-loaded ``<img>`` → resolve ``data-src`` / ``data-original``.
+    4. Convert to Markdown using a custom ``MarkdownConverter`` subclass that
+       renders ``<figure>`` as ``![alt](url)\\n*caption*``.
+
+    Args:
+        raw_html: The full HTML of the downloaded page (``article.html``).
+
+    Returns:
+        A Markdown string, or an empty string if conversion fails.
+    """
+    try:
+        from bs4 import BeautifulSoup, Tag
+        from markdownify import MarkdownConverter
+    except ImportError:
+        log.warning(
+            "markdownify and/or beautifulsoup4 are required for Markdown output. "
+            "Install them with: pip install markdownify"
+        )
+        return ""
+
+    # ------------------------------------------------------------------
+    # Custom converter: render <figure> as image + italic caption below.
+    # ------------------------------------------------------------------
+    class _ArticleConverter(MarkdownConverter):
+        def convert_figure(self, el, text, **kwargs):
+            img = el.find("img")
+            cap = el.find("figcaption")
+            if img is None:
+                return text or ""
+            src = img.get("src", "")
+            alt = img.get("alt", "").replace("\n", " ").strip()
+            caption = cap.get_text(" ", strip=True) if cap else alt
+            caption = caption.replace("\n", " ").strip()
+            md = f"\n![{alt}]({src})\n"
+            if caption:
+                md += f"*{caption}*\n"
+            return md
+
+    soup = BeautifulSoup(raw_html, "lxml")
+
+    # 1. Find article body container.
+    container = None
+    for selector in _MD_BODY_SELECTORS:
+        container = soup.select_one(selector)
+        if container:
+            break
+    if container is None:
+        container = soup.find("body") or soup
+
+    container = deepcopy(container)
+
+    # 2. Remove boilerplate.
+    for selector in _MD_REMOVE_SELECTORS:
+        for el in container.select(selector):
+            el.decompose()
+
+    # 3a. Normalise video figures → <figure><img><figcaption>
+    #     (e.g. znews.vn <figure class="video cms-video" data-video-src="...">)
+    for fig in container.find_all("figure", class_=re.compile(r"\bvideo\b")):
+        video_url = (
+            fig.get("data-video-src")
+            or fig.get("source-url")
+            or ""
+        )
+        # Thumbnail from inner div background-image or <video poster>
+        thumb_url = ""
+        inner_div = fig.find("div", style=True)
+        if inner_div:
+            m = re.search(r"background-image:\s*url\(['\"]?([^'\")\s]+)['\"]?\)", inner_div.get("style", ""))
+            if m:
+                thumb_url = m.group(1)
+        if not thumb_url:
+            video_tag = fig.find("video")
+            if video_tag:
+                thumb_url = video_tag.get("poster", "")
+
+        # Caption from existing figcaption: prefer the <strong> title link
+        # over the full description text that some sites embed there.
+        figcap = fig.find("figcaption")
+        caption_text = ""
+        if figcap:
+            strong = figcap.find("strong")
+            if strong:
+                caption_text = strong.get_text(" ", strip=True)
+            else:
+                caption_text = figcap.get_text(" ", strip=True)
+
+        # Build replacement <figure>
+        img_html = f'<img src="{thumb_url}" alt="▶ Video">' if thumb_url else ""
+        cap_html = f"<figcaption>{caption_text}</figcaption>" if caption_text else ""
+        link_html = f'<a href="{video_url}">{img_html or "▶ Video"}</a>'
+        new_fig = BeautifulSoup(f"<figure>{link_html}{cap_html}</figure>", "lxml").find("figure")
+        fig.replace_with(new_fig)
+
+    # 3b. Normalise picture tables → <figure><img><figcaption>
+    #     (e.g. znews.vn <table class="picture">)
+    for tbl in container.find_all("table", class_=re.compile(r"\bpicture\b")):
+        img = tbl.find("img")
+        cap_td = tbl.find("td", class_=re.compile(r"\bcaption\b|\bpCaption\b"))
+        if not img:
+            tbl.decompose()
+            continue
+        real_src = (
+            img.get("data-src")
+            or img.get("data-original")
+            or img.get("data-lazy-src")
+            or img.get("src", "")
+        )
+        if real_src.startswith("data:"):
+            real_src = ""
+        if not real_src:
+            tbl.decompose()
+            continue
+        caption = cap_td.get_text(" ", strip=True) if cap_td else img.get("title") or img.get("alt", "")
+        cap_html = f"<figcaption>{caption}</figcaption>" if caption else ""
+        new_fig = BeautifulSoup(
+            f'<figure><img src="{real_src}" alt="{caption}">{cap_html}</figure>', "lxml"
+        ).find("figure")
+        tbl.replace_with(new_fig)
+
+    # 4. Fix lazy-loaded images (general case).
+    for img in container.find_all("img"):
+        lazy_src = (
+            img.get("data-original")
+            or img.get("data-src")
+            or img.get("data-lazy-src")
+        )
+        if lazy_src and not lazy_src.startswith("data:"):
+            img["src"] = lazy_src
+        elif img.get("src", "").startswith("data:") and not lazy_src:
+            img.decompose()
+
+    # 5. Normalise plain figures (tuoitre.vn etc.):
+    #    fix lazy img src, keep figcaption for convert_figure above.
+    for fig in container.find_all("figure"):
+        img = fig.find("img")
+        if img:
+            lazy_src = (
+                img.get("data-original")
+                or img.get("data-src")
+                or img.get("data-lazy-src")
+            )
+            if lazy_src and not lazy_src.startswith("data:"):
+                img["src"] = lazy_src
+
+    # 6. Convert to Markdown.
+    md = _ArticleConverter(heading_style="ATX", bullets="-").convert_soup(container)
+
+    # Collapse 3+ consecutive blank lines to 2.
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
+
 
 class OutputFormatter:
     """Class that converts the article top node into text, cleaning up

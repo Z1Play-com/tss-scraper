@@ -47,7 +47,7 @@ def get_arparse() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-format",
         "-of",
-        choices=["csv", "json", "text"],
+        choices=["csv", "json", "text", "markdown"],
         default="json",
         help="The output format of the parsed article.",
     )
@@ -242,6 +242,9 @@ def run(args: argparse.Namespace):
         elif args.output_format == "text":
             write_output(f"{article.title}\n\n")
             write_output(article.text)
+        elif args.output_format == "markdown":
+            write_output(f"# {article.title}\n\n")
+            write_output(article.text_markdown)
         else:
             raise ValueError(f"Unknown output format: {args.output_format}")
 

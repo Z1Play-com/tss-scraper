@@ -3,112 +3,16 @@
 from __future__ import annotations
 
 import logging
-import re
 from typing import Optional
 
-from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
-from markdownify import MarkdownConverter
 from pydantic import BaseModel, HttpUrl
 
-import newspaper
 from newspaper import Article
 from newspaper.configuration import Configuration
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
-
-# CSS selectors / attributes whose elements should be stripped from the
-# article body before converting to markdown (non-exhaustive but covers
-# most common boilerplate).
-_REMOVE_SELECTORS = [
-    "script", "style", "noscript", "iframe",
-    "nav", "header", "footer",
-    # Related / recommended content boxes
-    '[type="RelatedOneNews"]',
-    '[class*="related"]', '[id*="related"]',
-    '[class*="recommend"]', '[id*="recommend"]',
-    # Social sharing / follow widgets
-    '[class*="social"]', '[class*="share"]',
-    '[class*="follow"]', '[class*="subscribe"]',
-    # Ads / promo
-    '[class*=" ad "]', '[class*="advertisement"]',
-    '[class*="promo"]', '[id*="promo"]',
-    # Comments
-    '[class*="comment"]', '[id*="comment"]',
-    # Newsletter signup
-    '[class*="newsletter"]', '[id*="newsletter"]',
-]
-
-# Ordered list of selectors used to locate the main article body container.
-_ARTICLE_BODY_SELECTORS = [
-    '[itemprop="articleBody"]',
-    '[data-role="content"]',
-    "article",
-    '[class*="article-body"]',
-    '[class*="article-content"]',
-    '[id*="article-body"]',
-    '[id*="article-content"]',
-    '[class*="post-content"]',
-    '[class*="entry-content"]',
-    '[class*="detail-content"]',
-]
-
-
-def _build_markdown(raw_html: str) -> str:
-    """Convert raw article page HTML to clean Markdown, including images.
-
-    Strategy:
-    1. Find the main article body using common selectors.
-    2. Strip non-content boilerplate inside the container.
-    3. Normalise lazy-loaded images (data-original / data-src → src).
-    4. Promote figcaption text into the img alt attribute, then remove it.
-    5. Run markdownify on the resulting HTML.
-    """
-    soup = BeautifulSoup(raw_html, "lxml")
-
-    # 1. Locate article body container.
-    container = None
-    for selector in _ARTICLE_BODY_SELECTORS:
-        container = soup.select_one(selector)
-        if container:
-            break
-    if container is None:
-        container = soup.find("body") or soup
-
-    # Work on a copy so we don't mutate the original soup.
-    from copy import deepcopy
-    container = deepcopy(container)
-
-    # 2. Remove boilerplate elements.
-    for selector in _REMOVE_SELECTORS:
-        for el in container.select(selector):
-            el.decompose()
-
-    # 3. Fix lazy-loaded images.
-    for img in container.find_all("img"):
-        lazy_src = img.get("data-original") or img.get("data-src") or img.get("data-lazy-src")
-        if lazy_src:
-            img["src"] = lazy_src
-
-    # 4. Move figcaption text into img alt, then remove the figcaption element.
-    for fig in container.find_all("figure"):
-        img = fig.find("img")
-        cap = fig.find("figcaption")
-        if img and cap:
-            caption_text = cap.get_text(" ", strip=True)
-            if caption_text:
-                img["alt"] = caption_text
-                img["title"] = caption_text
-        if cap:
-            cap.decompose()
-
-    # 5. Convert to Markdown.
-    md = MarkdownConverter(heading_style="ATX", bullets="-").convert_soup(container)
-
-    # Light post-processing: collapse 3+ consecutive blank lines to 2.
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    return md.strip()
 
 app = FastAPI(
     title="Article Crawler API",
@@ -188,19 +92,13 @@ def _crawl(
             article.publish_date.isoformat() if article.publish_date else None
         )
 
-        text_markdown = ""
-        try:
-            text_markdown = _build_markdown(article.html)
-        except Exception:
-            log.warning("Could not build markdown for %s", url, exc_info=True)
-
         return ArticleResponse(
             url=article.url,
             title=article.title or "",
             authors=article.authors or [],
             publish_date=publish_date,
             text=article.text or "",
-            text_markdown=text_markdown,
+            text_markdown=article.text_markdown,
             top_image=article.top_image or None,
             images=list(article.images) if article.images else [],
             movies=article.movies or [],
