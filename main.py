@@ -10,6 +10,7 @@ from pydantic import BaseModel, HttpUrl
 
 from newspaper import Article
 from newspaper.configuration import Configuration
+import newspaper
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class ArticleResponse(BaseModel):
     meta_description: Optional[str]
     meta_lang: Optional[str]
     source_url: Optional[str]
+    article_type: str
 
 
 class CrawlRequest(BaseModel):
@@ -107,6 +109,7 @@ def _crawl(
             meta_description=article.meta_description or None,
             meta_lang=article.meta_lang or None,
             source_url=article.source_url or None,
+            article_type=article.article_type,
         )
     except Exception as exc:
         log.exception("Failed to crawl %s", url)
@@ -117,3 +120,122 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+@app.get("/popular", summary="Danh sách các nguồn tin phổ biến")
+def popular_urls():
+    """Trả về danh sách URL các nguồn tin tức phổ biến được định sẵn trong thư viện."""
+    return {"urls": newspaper.popular_urls()}
+
+
+# ---------------------------------------------------------------------------
+# Google Trends categories (Google Trends Daily RSS `cat` parameter values)
+# ---------------------------------------------------------------------------
+_TREND_CATEGORIES: dict[str, str] = {
+    "all":           "",   # tất cả
+    "business":      "b",  # kinh doanh
+    "entertainment": "e",  # giải trí
+    "health":        "m",  # sức khỏe
+    "sports":        "s",  # thể thao
+    "tech":          "t",  # công nghệ
+}
+
+
+def _fetch_trends(geo: str = "VN", hl: str = "vi", category: str = "") -> list[dict]:
+    """Fetch and parse Google Trends Daily RSS, returning rich trend objects.
+
+    Feedparser only captures the *last* ht:news_item per <item>; we parse
+    the raw XML ourselves to collect all related articles per trend entry.
+    """
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    cat_code = _TREND_CATEGORIES.get(category, category)
+    url = f"https://trends.google.com/trending/rss?geo={geo}&hl={hl}"
+    if cat_code:
+        url += f"&cat={cat_code}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            xml_bytes = resp.read()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Google Trends fetch failed: {exc}") from exc
+
+    NS = "https://trends.google.com/trending/rss"
+    root = ET.fromstring(xml_bytes)
+    channel = root.find("channel")
+    if channel is None:
+        return []
+
+    results = []
+    for item in channel.findall("item"):
+        title_el = item.find("title")
+        pub_el   = item.find("pubDate")
+        traffic_el = item.find(f"{{{NS}}}approx_traffic")
+        picture_el = item.find(f"{{{NS}}}picture")
+
+        # Collect all related news articles (up to 3 per trend)
+        related = []
+        for ni in item.findall(f"{{{NS}}}news_item"):
+            ni_title = ni.find(f"{{{NS}}}news_item_title")
+            ni_url   = ni.find(f"{{{NS}}}news_item_url")
+            ni_src   = ni.find(f"{{{NS}}}news_item_source")
+            ni_pic   = ni.find(f"{{{NS}}}news_item_picture")
+            related.append({
+                "title":  ni_title.text if ni_title is not None else None,
+                "url":    ni_url.text   if ni_url   is not None else None,
+                "source": ni_src.text   if ni_src   is not None else None,
+                "image":  ni_pic.text   if ni_pic   is not None else None,
+            })
+
+        results.append({
+            "keyword":      title_el.text  if title_el  is not None else None,
+            "traffic":      traffic_el.text if traffic_el is not None else None,
+            "published_at": pub_el.text    if pub_el    is not None else None,
+            "image":        picture_el.text if picture_el is not None else None,
+            "category":     category or "all",
+            "related":      related,
+        })
+
+    return results
+
+
+@app.get("/hot", summary="Các từ khóa đang hot trên Google Trends")
+def hot_trends(
+    geo: str = Query(default="VN", description="Mã quốc gia ISO (VN, US, JP…)"),
+    hl: str = Query(default="vi", description="Ngôn ngữ hiển thị (vi, en…)"),
+    category: str = Query(
+        default="all",
+        description="Danh mục: all | business | entertainment | health | sports | tech",
+    ),
+):
+    """Trả về danh sách xu hướng tìm kiếm trên Google Trends, kèm bài liên quan.
+
+    - Mỗi trend có: keyword, traffic, published_at, image, category, related (tối đa 3 bài)
+    - Nếu `category=all`, tổng hợp tất cả danh mục và trả về danh sách đã dedup.
+    """
+    if category == "all":
+        seen: set[str] = set()
+        merged: list[dict] = []
+        for cat_name in _TREND_CATEGORIES:
+            if cat_name == "all":
+                continue
+            for trend in _fetch_trends(geo=geo, hl=hl, category=cat_name):
+                key = (trend["keyword"] or "").lower()
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(trend)
+        # Sort by traffic descending (e.g. "500+" > "200+" > "100+")
+        def _traffic_val(t: dict) -> int:
+            tr = t.get("traffic") or "0"
+            return int(tr.replace("+", "").replace(",", "") or 0)
+        merged.sort(key=_traffic_val, reverse=True)
+        return {"total": len(merged), "geo": geo, "trends": merged}
+    else:
+        if category not in _TREND_CATEGORIES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown category '{category}'. Valid: {list(_TREND_CATEGORIES.keys())}",
+            )
+        trends = _fetch_trends(geo=geo, hl=hl, category=category)
+        return {"total": len(trends), "geo": geo, "category": category, "trends": trends}

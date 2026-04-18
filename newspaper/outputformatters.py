@@ -32,6 +32,7 @@ _MD_REMOVE_SELECTORS = [
     "script", "style", "noscript", "iframe",
     "nav", "header", "footer",
     '[type="RelatedOneNews"]',          # tuoitre.vn related box
+    '.article-relate',
     'table.article',                    # znews.vn inline related-article tables
     '[class*="inner-article"]',
     '[class*="related"]', '[id*="related"]',
@@ -40,12 +41,23 @@ _MD_REMOVE_SELECTORS = [
     '[class*="news-relation"]',         # techz.vn related box
     '[id="original_link"]',             # techz.vn source link box
     '[class*="notebox"]',
+    '[class*="evtBox"]',               # eva.vn related/promo boxes
+    '.banner-ads',                      # vnexpress.net ad banners
+    '.width-detail-photo',              # vnexpress.net author footer
     '[class*="social"]', '[class*="share"]',
     '[class*="follow"]', '[class*="subscribe"]',
     '[class*=" ad "]', '[class*="advertisement"]',
     '[class*="promo"]', '[id*="promo"]',
     '[class*="comment"]', '[id*="comment"]',
     '[class*="newsletter"]', '[id*="newsletter"]',
+    # tienphong.vn
+    '.breadcrumb', '.breadcrumb-detail',
+    '.img-ggnews',                      # Google News follow button
+    '.article__header',                 # repeated title + author + date block
+    '.article__social', '.audio-social',  # share/audio toolbar
+    '.article-footer',                  # author name + hashtag block at bottom
+    '.rennab',                          # ad placeholder divs
+    '[class*="article__tag"]', '[class*="tag-list"]',
 ]
 
 # Ordered list of selectors to locate the main article body container.
@@ -61,11 +73,15 @@ _MD_BODY_SELECTORS = [
     '[class*="entry-content"]',
     '[class*="detail-content"]',
     '[class*="entry-body"]',
+    ".fck_detail",          # vnexpress.net article body
+    "[class*='article__body']",  # tienphong.vn / sites using BEM naming
+    "[class*='cms-body']",
+    "[class*='zce-content']",
     "article",
 ]
 
 
-def build_markdown(raw_html: str) -> str:
+def build_markdown(raw_html: str, top_node_html: str | None = None) -> str:
     """Convert a raw article page HTML string to clean Markdown with images,
     videos and inline captions.
 
@@ -103,27 +119,47 @@ def build_markdown(raw_html: str) -> str:
         def convert_figure(self, el, text, **kwargs):
             img = el.find("img")
             cap = el.find("figcaption")
+            link = el.find("a")
             if img is None:
                 return text or ""
             src = img.get("src", "")
             alt = img.get("alt", "").replace("\n", " ").strip()
-            caption = cap.get_text(" ", strip=True) if cap else alt
+            caption = cap.get_text(" ", strip=True) if cap else ""
             caption = caption.replace("\n", " ").strip()
-            md = f"\n![{alt}]({src})\n"
+            display_alt = caption or alt
+            href = link.get("href", "") if link else ""
+            if href:
+                md = f"\n[![{display_alt}]({src})]({href})\n"
+            else:
+                md = f"\n![{display_alt}]({src})\n"
             if caption:
                 md += f"*{caption}*\n"
             return md
 
-    soup = BeautifulSoup(raw_html, "lxml")
-
     # 1. Find article body container.
+    # Prefer newspaper's already-computed top_node when it contains enough
+    # content (>= 500 text chars).  If newspaper mis-identified the top_node
+    # (e.g. picked a photo caption div), fall back to CSS selector search.
+    _MIN_TOP_NODE_TEXT = 500
     container = None
-    for selector in _MD_BODY_SELECTORS:
-        container = soup.select_one(selector)
-        if container:
-            break
+    if top_node_html:
+        _tn_soup = BeautifulSoup(top_node_html, "lxml")
+        _tn_body = _tn_soup.find("body")
+        _tn_root = next(
+            (c for c in (_tn_body.children if _tn_body else []) if hasattr(c, "name") and c.name),
+            _tn_body,
+        )
+        if _tn_root and len(_tn_root.get_text()) >= _MIN_TOP_NODE_TEXT:
+            container = _tn_root
+
     if container is None:
-        container = soup.find("body") or soup
+        soup = BeautifulSoup(raw_html, "lxml")
+        for selector in _MD_BODY_SELECTORS:
+            container = soup.select_one(selector)
+            if container:
+                break
+        if container is None:
+            container = soup.find("body") or soup
 
     container = deepcopy(container)
 
@@ -132,7 +168,62 @@ def build_markdown(raw_html: str) -> str:
         for el in container.select(selector):
             el.decompose()
 
-    # 3a. Normalise video figures → <figure><img><figcaption>
+    # 3a. Normalise vnexpress-style photo galleries:
+    #     Each slide is a <div class="item_slide_show"> with:
+    #     - <div class="block_thumb_slide_show" data-src="..."> for the image
+    #     - <p class="Normal"> for the caption
+    #     Duplicate slides (same URL) are skipped.
+    #
+    #     Also handle <div data-component="true"> which are JS-rendered gallery
+    #     components: the real image URL is in data-component-back and caption
+    #     in data-component-caption (HTML-encoded JSON string).
+    _seen_slide_urls: set = set()
+
+    # Convert data-component gallery elements first (before item_slide_show),
+    # so their placeholder <img src> doesn't cause phantom images in step 4.
+    for comp in container.find_all("div", attrs={"data-component": "true"}):
+        img_url = comp.get("data-component-back", "").strip()
+        if not img_url:
+            comp.decompose()
+            continue
+        # data-component-caption is a JSON-encoded HTML string; decode it.
+        cap_raw = comp.get("data-component-caption", "")
+        try:
+            import json as _json
+            cap_raw = _json.loads(cap_raw)
+        except Exception:
+            pass
+        caption = BeautifulSoup(cap_raw, "lxml").get_text(" ", strip=True)
+        if img_url not in _seen_slide_urls:
+            _seen_slide_urls.add(img_url)
+            cap_html = f"<figcaption>{caption}</figcaption>" if caption else ""
+            new_fig = BeautifulSoup(
+                f'<figure><img src="{img_url}" alt="{caption}">{cap_html}</figure>', "lxml"
+            ).find("figure")
+            comp.replace_with(new_fig)
+        else:
+            comp.decompose()
+
+    for slide in container.find_all("div", class_="item_slide_show"):
+        bt = slide.find("div", class_="block_thumb_slide_show")
+        img_url = bt.get("data-src", "") if bt else ""
+        # skip if no image or already seen
+        if not img_url or img_url in _seen_slide_urls:
+            slide.decompose()
+            continue
+        _seen_slide_urls.add(img_url)
+        cap_el = slide.find("p", class_="Normal")
+        caption = cap_el.get_text(" ", strip=True) if cap_el else ""
+        cap_html = f"<figcaption>{caption}</figcaption>" if caption else ""
+        new_fig = BeautifulSoup(
+            f'<figure><img src="{img_url}" alt="{caption}">{cap_html}</figure>', "lxml"
+        ).find("figure")
+        slide.replace_with(new_fig)
+    # Remove alternate gallery representations that duplicate the slides above.
+    for el in container.select(".gallery-detail-photo, .gallery_block, .medium-insert-embed"):
+        el.decompose()
+
+    # 3b. Normalise video figures → <figure><img><figcaption>
     #     (e.g. znews.vn <figure class="video cms-video" data-video-src="...">)
     for fig in container.find_all("figure", class_=re.compile(r"\bvideo\b")):
         video_url = (
@@ -226,6 +317,23 @@ def build_markdown(raw_html: str) -> str:
 
     # Collapse 3+ consecutive blank lines to 2.
     md = re.sub(r"\n{3,}", "\n\n", md)
+
+    # Strip Vietnamese newspaper abbreviation prefixes at the start of a
+    # paragraph.  Two forms:
+    #   "TPO - ", "HNM - ", "NDO - ", "ANTD - ", "GD&TĐ - "
+    #   "(NLĐO)- ", "(TTXVN)- ", "(SGGP)- "
+    _UPPER = r"A-ZĐÁÀẢÃẠĂẮẶẰẲẴÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴ"
+    md = re.sub(
+        rf"(?m)^\(([{_UPPER}][{_UPPER}0-9&/]{{1,9}})\)\s*[-–]\s*",
+        "",
+        md,
+    )
+    md = re.sub(
+        rf"(?m)^([{_UPPER}][{_UPPER}0-9&/]{{1,7}})\s*[-–]\s+",
+        "",
+        md,
+    )
+
     return md.strip()
 
 

@@ -14,6 +14,7 @@ from newspaper.extractors.image_extractor import ImageExtractor
 from newspaper.extractors.metadata_extractor import MetadataExtractor
 from newspaper.extractors.pubdate_extractor import PubdateExtractor
 from newspaper.extractors.title_extractor import TitleExtractor
+from newspaper.extractors.article_type_extractor import ArticleTypeExtractor
 from newspaper.extractors.videos_extractor import VideoExtractor
 from newspaper.utils import Video
 
@@ -53,6 +54,7 @@ class ContentExtractor:
         self.categories_extractor = CategoryExtractor(config)
         self.image_extractor = ImageExtractor(config)
         self.video_extractor = VideoExtractor(config)
+        self.article_type_extractor = ArticleTypeExtractor()
 
     def get_authors(self, doc: HtmlElement) -> list[str]:
         """Fetch the authors of the article, return as a list
@@ -115,6 +117,13 @@ class ContentExtractor:
     def get_metadata(self, article_url: str, doc: HtmlElement) -> dict[str, Any]:
         """Parse the article's HTML for any known metadata attributes"""
         return self.metadata_extractor.parse(article_url, doc)
+
+    def get_article_type(self, url: str, doc: HtmlElement, text: str = "") -> str:
+        """Detect and return the article content type.
+
+        Returns one of: normal, video, podcast, longform, infographic, photo, live.
+        """
+        return self.article_type_extractor.detect(url, doc, text)
 
     def parse_images(self, article_url: str, doc: HtmlElement, top_node: HtmlElement):
         """Parse images in an article"""
