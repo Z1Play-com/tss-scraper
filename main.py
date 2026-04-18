@@ -116,6 +116,47 @@ def _crawl(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+class SourceResponse(BaseModel):
+    url: str
+    domain: str
+    article_urls: list[str]
+    total: int
+
+
+@app.get("/source", response_model=SourceResponse, summary="Discover article URLs from a homepage")
+def scrape_source(
+    url: str = Query(..., description="Homepage or source URL to discover articles from"),
+    language: Optional[str] = Query(None, description="Language code, e.g. 'vi', 'en'"),
+    only_in_path: bool = Query(False, description="Only include article URLs within the same URL path"),
+):
+    """Discover article URLs from a news source homepage using newspaper4k's source builder.
+
+    Uses ``only_homepage=True`` for fast, single-page extraction (no category/feed crawling).
+    """
+    try:
+        config = Configuration()
+        if language:
+            config.language = language
+
+        source = newspaper.build(
+            url,
+            config=config,
+            only_homepage=True,
+            only_in_path=only_in_path,
+        )
+        article_urls = [a.url for a in source.articles if a.url]
+
+        return SourceResponse(
+            url=url,
+            domain=source.domain or "",
+            article_urls=article_urls,
+            total=len(article_urls),
+        )
+    except Exception as exc:
+        log.exception("Failed to scrape source %s", url)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 if __name__ == "__main__":
     import uvicorn
 
