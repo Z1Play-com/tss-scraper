@@ -53,10 +53,13 @@ _MD_REMOVE_SELECTORS = [
     # tienphong.vn
     '.breadcrumb', '.breadcrumb-detail',
     '.img-ggnews',                      # Google News follow button
+    'img[src*="google-news"]',          # plo.vn and similar Google News img
+    'img[alt*="Google News"]',          # fallback by alt text
     '.article__header',                 # repeated title + author + date block
     '.article__social', '.audio-social',  # share/audio toolbar
     '.article-footer',                  # author name + hashtag block at bottom
     '.rennab',                          # ad placeholder divs
+    '.link-content-footer',
     '[class*="article__tag"]', '[class*="tag-list"]',
 ]
 
@@ -116,10 +119,13 @@ def build_markdown(raw_html: str, top_node_html: str | None = None) -> str:
     # Custom converter: render <figure> as image + italic caption below.
     # ------------------------------------------------------------------
     class _ArticleConverter(MarkdownConverter):
+        def convert_a(self, el, text, **kwargs):
+            """Strip links, keep only the visible text."""
+            return text
+
         def convert_figure(self, el, text, **kwargs):
             img = el.find("img")
             cap = el.find("figcaption")
-            link = el.find("a")
             if img is None:
                 return text or ""
             src = img.get("src", "")
@@ -127,21 +133,27 @@ def build_markdown(raw_html: str, top_node_html: str | None = None) -> str:
             caption = cap.get_text(" ", strip=True) if cap else ""
             caption = caption.replace("\n", " ").strip()
             display_alt = caption or alt
-            href = link.get("href", "") if link else ""
-            if href:
-                md = f"\n[![{display_alt}]({src})]({href})\n"
-            else:
-                md = f"\n![{display_alt}]({src})\n"
+            md = f"\n![{display_alt}]({src})\n"
             if caption:
                 md += f"*{caption}*\n"
             return md
 
+    def _select_container_from_raw(soup):
+        for selector in _MD_BODY_SELECTORS:
+            found = soup.select_one(selector)
+            if found:
+                return found
+        return soup.find("body") or soup
+
     # 1. Find article body container.
-    # Prefer newspaper's already-computed top_node when it contains enough
-    # content (>= 500 text chars).  If newspaper mis-identified the top_node
-    # (e.g. picked a photo caption div), fall back to CSS selector search.
+    # Prefer newspaper's top_node for structure fidelity. But if it loses images
+    # (common on sites where image blocks are sibling nodes), fall back to
+    # selector-based container from raw HTML.
     _MIN_TOP_NODE_TEXT = 500
-    container = None
+    soup_raw = BeautifulSoup(raw_html, "lxml")
+    top_container = None
+    raw_container = _select_container_from_raw(soup_raw)
+
     if top_node_html:
         _tn_soup = BeautifulSoup(top_node_html, "lxml")
         _tn_body = _tn_soup.find("body")
@@ -150,23 +162,20 @@ def build_markdown(raw_html: str, top_node_html: str | None = None) -> str:
             _tn_body,
         )
         if _tn_root and len(_tn_root.get_text()) >= _MIN_TOP_NODE_TEXT:
-            container = _tn_root
+            top_container = _tn_root
 
-    if container is None:
-        soup = BeautifulSoup(raw_html, "lxml")
-        for selector in _MD_BODY_SELECTORS:
-            container = soup.select_one(selector)
-            if container:
-                break
-        if container is None:
-            container = soup.find("body") or soup
-
+    container = top_container or raw_container
     container = deepcopy(container)
 
     # 2. Remove boilerplate.
     for selector in _MD_REMOVE_SELECTORS:
         for el in container.select(selector):
+            # If el is an inline element (img) inside a block that becomes empty,
+            # remove the parent block too.
+            parent = el.parent
             el.decompose()
+            if parent and parent.name in ("p", "div", "span") and not parent.get_text(strip=True):
+                parent.decompose()
 
     # 3a. Normalise vnexpress-style photo galleries:
     #     Each slide is a <div class="item_slide_show"> with:
@@ -265,7 +274,6 @@ def build_markdown(raw_html: str, top_node_html: str | None = None) -> str:
     #     (e.g. znews.vn <table class="picture">)
     for tbl in container.find_all("table", class_=re.compile(r"\bpicture\b")):
         img = tbl.find("img")
-        cap_td = tbl.find("td", class_=re.compile(r"\bcaption\b|\bpCaption\b"))
         if not img:
             tbl.decompose()
             continue
@@ -280,12 +288,27 @@ def build_markdown(raw_html: str, top_node_html: str | None = None) -> str:
         if not real_src:
             tbl.decompose()
             continue
-        caption = cap_td.get_text(" ", strip=True) if cap_td else img.get("title") or img.get("alt", "")
-        cap_html = f"<figcaption>{caption}</figcaption>" if caption else ""
-        new_fig = BeautifulSoup(
-            f'<figure><img src="{real_src}" alt="{caption}">{cap_html}</figure>', "lxml"
-        ).find("figure")
-        tbl.replace_with(new_fig)
+        # For znews-like "table.picture", the table often stores:
+        # - image in first row
+        # - paragraph text in another row (not an image caption).
+        # Keep image alt short and emit paragraph as normal article text.
+        img_alt = (img.get("title") or img.get("alt") or "").strip()
+        # Avoid mapping table text rows as image captions for this layout.
+        caption = ""
+        cap_html = ""
+        fig_html = f'<figure><img src="{real_src}" alt="{img_alt}">{cap_html}</figure>'
+        wrapper = BeautifulSoup(f"<div>{fig_html}</div>", "lxml").find("div")
+
+        # Add narrative text rows as paragraph blocks after the image.
+        for td in tbl.find_all("td"):
+            if td.find("img"):
+                continue
+            text_line = td.get_text(" ", strip=True)
+            if text_line:
+                p = BeautifulSoup(f"<p>{text_line}</p>", "lxml").find("p")
+                wrapper.append(p)
+
+        tbl.replace_with(wrapper)
 
     # 4. Fix lazy-loaded images (general case).
     for img in container.find_all("img"):
@@ -312,11 +335,21 @@ def build_markdown(raw_html: str, top_node_html: str | None = None) -> str:
             if lazy_src and not lazy_src.startswith("data:"):
                 img["src"] = lazy_src
 
-    # 6. Convert to Markdown.
-    md = _ArticleConverter(heading_style="ATX", bullets="-").convert_soup(container)
+    def _to_markdown(target_container):
+        md_out = _ArticleConverter(heading_style="ATX", bullets="-").convert_soup(target_container)
+        md_out = re.sub(r"\n{3,}", "\n\n", md_out)
+        return md_out.strip()
 
-    # Collapse 3+ consecutive blank lines to 2.
-    md = re.sub(r"\n{3,}", "\n\n", md)
+    # 6. Convert to Markdown.
+    md = _to_markdown(container)
+
+    # If top_node-based markdown has no images but raw container has images,
+    # re-run conversion from raw container so image positions follow article DOM.
+    if top_container is not None:
+        raw_has_images = bool(raw_container.find("img"))
+        top_has_images_md = "![" in md
+        if raw_has_images and not top_has_images_md:
+            md = build_markdown(raw_html, top_node_html=None)
 
     # Strip Vietnamese newspaper abbreviation prefixes at the start of a
     # paragraph.  Two forms:

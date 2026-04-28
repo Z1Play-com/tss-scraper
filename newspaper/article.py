@@ -501,7 +501,14 @@ class Article:
             if self.top_node is not None:
                 from lxml import etree
                 top_node_html = etree.tostring(self.top_node, encoding="unicode")
-            self.text_markdown = build_markdown(self.html, top_node_html=top_node_html)
+            md = build_markdown(self.html, top_node_html=top_node_html)
+            if self._looks_suspicious_markdown(md, self.text):
+                # Rebuild from raw page container when top-node markdown appears
+                # truncated (seen on some image-heavy/news widgets).
+                md_fallback = build_markdown(self.html, top_node_html=None)
+                if len(md_fallback.strip()) > len(md.strip()):
+                    md = md_fallback
+            self.text_markdown = md
         except Exception:
             log.warning("Could not build markdown for %s", self.url, exc_info=True)
 
@@ -509,6 +516,18 @@ class Article:
 
         self.is_parsed = True
         return self
+
+    @staticmethod
+    def _looks_suspicious_markdown(markdown: str, plain_text: str) -> bool:
+        md = (markdown or "").strip()
+        txt = (plain_text or "").strip()
+        if not md:
+            return True
+        if md.endswith("|"):
+            return True
+        if txt and len(txt) >= 400 and len(md) < int(len(txt) * 0.6):
+            return True
+        return False
 
     @staticmethod
     def _strip_brand_suffix(description: str, site_name: str = "") -> str:
