@@ -368,12 +368,18 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
     if lead:
         parts.append(lead.get_text(" ", strip=True))
 
-    # 2. Article body
+    # 2. Article body (order: specific layouts first, then common CMS blocks)
     body = (
         soup.find(class_="article__body")
         or soup.find(class_="article-body")
         or soup.find(class_="detail__content")
         or soup.find(class_="article__content")
+        or soup.find(class_="edittor-content")  # VTC News (site uses this spelling)
+        or soup.find(class_="editor-content")
+        or soup.find(class_="fck_detail")
+        or soup.find(class_="entry-content")
+        or soup.find(class_="post-content")
+        or soup.find(class_="content-wrapper")  # VTC outer prose (fallback if no edittor)
     )
     if body:
         # Remove sidebar / related / footer elements inside body
@@ -384,56 +390,62 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
             parts.append(body_text)
 
     text = "\n\n".join(parts)
-    # Simple markdown: treat the lead as italic if present
+    # Markdown: lead italic when present; body blocks + images whenever body exists
+    # (must not nest body under `if lead` — many sites have no sapo but rich HTML body)
     md_parts: list[str] = []
     if lead:
         md_parts.append(f"_{lead.get_text(' ', strip=True)}_")
-        if body:
-            seen_images: set[str] = set()
-            body_md_parts: list[str] = []
 
-            # Walk common content blocks in DOM order and preserve inline images.
-            for el in body.find_all(["p", "h2", "h3", "h4", "li", "blockquote", "figure", "img"], recursive=True):
-                name = el.name.lower() if el.name else ""
+    if body:
+        seen_images: set[str] = set()
+        body_md_parts: list[str] = []
 
-                if name == "figure":
-                    img = el.find("img")
-                    caption = el.find("figcaption")
-                    if img:
-                        src = _img_resolved_url(img, base_url)
-                        if src and src not in seen_images:
-                            seen_images.add(src)
-                            alt = (img.get("alt") or "").strip()
-                            body_md_parts.append(f"![{alt}]({src})")
-                            cap = caption.get_text(" ", strip=True) if caption else ""
-                            if cap:
-                                body_md_parts.append(f"*{cap}*")
-                    continue
+        # Walk common content blocks in DOM order and preserve inline images.
+        for el in body.find_all(
+            ["p", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figure", "img"],
+            recursive=True,
+        ):
+            name = el.name.lower() if el.name else ""
 
-                if name == "img":
-                    src = _img_resolved_url(el, base_url)
+            if name == "figure":
+                img = el.find("img")
+                caption = el.find("figcaption")
+                if img:
+                    src = _img_resolved_url(img, base_url)
                     if src and src not in seen_images:
                         seen_images.add(src)
-                        alt = (el.get("alt") or "").strip()
+                        alt = (img.get("alt") or "").strip()
                         body_md_parts.append(f"![{alt}]({src})")
-                    continue
+                        cap = caption.get_text(" ", strip=True) if caption else ""
+                        if cap:
+                            body_md_parts.append(f"*{cap}*")
+                continue
 
-                # Avoid duplicate nested text (e.g. <li> within another <li>)
-                if el.find_parent(["p", "h2", "h3", "h4", "li", "blockquote", "figure"]):
-                    continue
+            if name == "img":
+                src = _img_resolved_url(el, base_url)
+                if src and src not in seen_images:
+                    seen_images.add(src)
+                    alt = (el.get("alt") or "").strip()
+                    body_md_parts.append(f"![{alt}]({src})")
+                continue
 
-                text_line = el.get_text(" ", strip=True)
-                if text_line:
-                    body_md_parts.append(text_line)
+            # Avoid duplicate nested text (e.g. <li> within another <li>)
+            if el.find_parent(["p", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figure"]):
+                continue
 
-            if body_md_parts:
-                md_parts.append("\n\n".join(body_md_parts))
-            else:
-                body_md = body.get_text(" ", strip=True)
-                if body_md:
-                    md_parts.append(body_md)
-    else:
+            text_line = el.get_text(" ", strip=True)
+            if text_line:
+                body_md_parts.append(text_line)
+
+        if body_md_parts:
+            md_parts.append("\n\n".join(body_md_parts))
+        else:
+            body_md = body.get_text(" ", strip=True)
+            if body_md:
+                md_parts.append(body_md)
+    elif not md_parts:
         md_parts = parts[:]
+
     text_markdown = "\n\n".join(md_parts)
     return text, text_markdown
 
@@ -485,6 +497,9 @@ def _crawl(
                 text_markdown = bs_md
         elif download_media and "![" in bs_md and "](" in bs_md:
             # newspaper's text_markdown usually has no inline images; BS4 body walk emits ![alt](url).
+            text_markdown = bs_md
+        elif not text_markdown.strip() and bs_md.strip():
+            # newspaper often omits text_markdown entirely while HTML body matches our selectors
             text_markdown = bs_md
         images = list(article.images) if article.images else []
 
