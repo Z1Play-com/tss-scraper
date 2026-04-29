@@ -11,7 +11,7 @@ import re
 import warnings
 from datetime import datetime
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 import urllib3
@@ -80,6 +80,31 @@ _VIDEO_EXTS = {".mp4", ".webm", ".ogv", ".mov", ".avi", ".m3u8"}
 
 # Regex to find markdown image references: ![alt](url)
 _MD_IMAGE_RE = re.compile(r'(!\[[^\]]*\])\(([^)\s]+)\)')
+
+
+def _img_resolved_url(img_tag, base_url: str) -> str | None:
+    """Best-effort image URL from an <img> tag (lazy-load attrs) made absolute."""
+    attrs_order = (
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+        "data-url",
+        "src",
+    )
+    raw: str | None = None
+    for key in attrs_order:
+        val = (img_tag.get(key) or "").strip()
+        if not val or val.lower().startswith("data:"):
+            continue
+        raw = val
+        break
+    if not raw:
+        return None
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    elif not raw.startswith(("http://", "https://")):
+        raw = urljoin(base_url, raw)
+    return raw
 
 
 def _guess_ext(url: str, content_type: str | None) -> str:
@@ -161,11 +186,25 @@ def _download_media(media_url: str, ref_date: datetime | None = None) -> str | N
         return None
 
 
-def _rewrite_markdown_images(text_markdown: str, ref_date: datetime | None = None) -> str:
+def _rewrite_markdown_images(
+    text_markdown: str,
+    ref_date: datetime | None = None,
+    base_url: str = "",
+) -> str:
     """Replace external image URLs in markdown ``![alt](url)`` with CDN URLs."""
+    def _abs_url(u: str) -> str:
+        u = u.strip()
+        if u.startswith("//"):
+            return "https:" + u
+        if u.startswith(("http://", "https://")):
+            return u
+        if base_url:
+            return urljoin(base_url, u)
+        return u
+
     def _replace(m: re.Match) -> str:
         prefix = m.group(1)          # e.g. "![alt text]"
-        img_url = m.group(2)
+        img_url = _abs_url(m.group(2))
         if not img_url.startswith(("http://", "https://")):
             return m.group(0)
         local_url = _download_media(img_url, ref_date)
@@ -306,7 +345,7 @@ def _extract_movies_from_html(html: str) -> list[str]:
     return urls
 
 
-def _extract_text_from_html(html: str) -> tuple[str, str]:
+def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
     """Extract (text, text_markdown) from article HTML using BS4.
 
     Targets the primary article body selectors used by laodong.vn:
@@ -315,6 +354,9 @@ def _extract_text_from_html(html: str) -> tuple[str, str]:
 
     Returns plain text and a simple markdown representation.
     Falls back to empty strings if nothing found.
+
+    *base_url* is the article page URL; used to absolutize relative / protocol-relative
+    image URLs so markdown and downstream media download work.
     """
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "html.parser")
@@ -357,8 +399,8 @@ def _extract_text_from_html(html: str) -> tuple[str, str]:
                 if name == "figure":
                     img = el.find("img")
                     caption = el.find("figcaption")
-                    if img and img.get("src"):
-                        src = img.get("src").strip()
+                    if img:
+                        src = _img_resolved_url(img, base_url)
                         if src and src not in seen_images:
                             seen_images.add(src)
                             alt = (img.get("alt") or "").strip()
@@ -369,7 +411,7 @@ def _extract_text_from_html(html: str) -> tuple[str, str]:
                     continue
 
                 if name == "img":
-                    src = (el.get("src") or "").strip()
+                    src = _img_resolved_url(el, base_url)
                     if src and src not in seen_images:
                         seen_images.add(src)
                         alt = (el.get("alt") or "").strip()
@@ -436,11 +478,14 @@ def _crawl(
         # fall back to BS4 extraction of .chappeau + article body.
         text = article.text or ""
         text_markdown = article.text_markdown or ""
+        bs_text, bs_md = _extract_text_from_html(html, final_url)
         if article.article_type == "video" or not text.strip():
-            bs_text, bs_md = _extract_text_from_html(html)
             if bs_text:
                 text = bs_text
                 text_markdown = bs_md
+        elif download_media and "![" in bs_md and "](" in bs_md:
+            # newspaper's text_markdown usually has no inline images; BS4 body walk emits ![alt](url).
+            text_markdown = bs_md
         images = list(article.images) if article.images else []
 
         # ── Media localisation ──────────────────────────────────────────────
@@ -467,7 +512,9 @@ def _crawl(
 
             # 3. inline images in text_markdown  (![alt](url) patterns)
             if text_markdown:
-                text_markdown = _rewrite_markdown_images(text_markdown, media_date)
+                text_markdown = _rewrite_markdown_images(
+                    text_markdown, media_date, base_url=final_url
+                )
 
             # 4. images list (all images referenced in the article)
             local_images: list[str] = []
