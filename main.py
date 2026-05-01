@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html as html_lib
 import logging
 import mimetypes
 import os
@@ -80,15 +81,26 @@ _VIDEO_EXTS = {".mp4", ".webm", ".ogv", ".mov", ".avi", ".m3u8"}
 
 # Regex to find markdown image references: ![alt](url)
 _MD_IMAGE_RE = re.compile(r'(!\[[^\]]*\])\(([^)\s]+)\)')
+_HTML_IMG_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=["\'])([^"\']+)(["\'])', re.IGNORECASE)
 
 
 def _img_resolved_url(img_tag, base_url: str) -> str | None:
     """Best-effort image URL from an <img> tag (lazy-load attrs) made absolute."""
+    def _pick_from_srcset(srcset_value: str) -> str | None:
+        # srcset format: "url1 320w, url2 640w" → prefer the first valid URL token.
+        for part in srcset_value.split(","):
+            token = (part or "").strip().split(" ")[0].strip()
+            if token and not token.lower().startswith("data:"):
+                return token
+        return None
+
     attrs_order = (
         "data-src",
         "data-original",
         "data-lazy-src",
         "data-url",
+        "data-srcset",
+        "srcset",
         "src",
     )
     raw: str | None = None
@@ -96,8 +108,26 @@ def _img_resolved_url(img_tag, base_url: str) -> str | None:
         val = (img_tag.get(key) or "").strip()
         if not val or val.lower().startswith("data:"):
             continue
+        if key in ("data-srcset", "srcset"):
+            picked = _pick_from_srcset(val)
+            if not picked:
+                continue
+            raw = picked
+            break
         raw = val
         break
+    # Fallback for <picture><source srcset>...<img ...></picture> patterns.
+    if not raw:
+        picture = img_tag.find_parent("picture")
+        if picture:
+            for source in picture.find_all("source"):
+                srcset = (source.get("srcset") or source.get("data-srcset") or "").strip()
+                if not srcset:
+                    continue
+                picked = _pick_from_srcset(srcset)
+                if picked:
+                    raw = picked
+                    break
     if not raw:
         return None
     if raw.startswith("//"):
@@ -213,6 +243,35 @@ def _rewrite_markdown_images(
         return m.group(0)
 
     return _MD_IMAGE_RE.sub(_replace, text_markdown)
+
+
+def _rewrite_html_image_sources(
+    text_markdown: str,
+    ref_date: datetime | None = None,
+    base_url: str = "",
+) -> str:
+    """Replace external image URLs in raw HTML <img src="..."> blocks with CDN URLs."""
+    def _abs_url(u: str) -> str:
+        u = u.strip()
+        if u.startswith("//"):
+            return "https:" + u
+        if u.startswith(("http://", "https://")):
+            return u
+        if base_url:
+            return urljoin(base_url, u)
+        return u
+
+    def _replace(m: re.Match) -> str:
+        prefix, img_url, quote = m.group(1), m.group(2), m.group(3)
+        abs_url = _abs_url(img_url)
+        if not abs_url.startswith(("http://", "https://")):
+            return m.group(0)
+        local_url = _download_media(abs_url, ref_date)
+        if local_url:
+            return f"{prefix}{local_url}{quote}"
+        return m.group(0)
+
+    return _HTML_IMG_SRC_RE.sub(_replace, text_markdown)
 
 
 def _fetch_html(url: str) -> tuple[str, str]:
@@ -397,7 +456,6 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
         md_parts.append(f"_{lead.get_text(' ', strip=True)}_")
 
     if body:
-        seen_images: set[str] = set()
         body_md_parts: list[str] = []
 
         # Walk common content blocks in DOM order and preserve inline images.
@@ -409,22 +467,27 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
 
             if name == "figure":
                 img = el.find("img")
-                caption = el.find("figcaption")
                 if img:
                     src = _img_resolved_url(img, base_url)
-                    if src and src not in seen_images:
-                        seen_images.add(src)
-                        alt = (img.get("alt") or "").strip()
-                        body_md_parts.append(f"![{alt}]({src})")
-                        cap = caption.get_text(" ", strip=True) if caption else ""
-                        if cap:
-                            body_md_parts.append(f"*{cap}*")
+                    if src:
+                        alt = html_lib.escape((img.get("alt") or "").strip(), quote=True)
+                        caption_tag = el.find("figcaption")
+                        caption_text = caption_tag.get_text(" ", strip=True) if caption_tag else ""
+                        caption_html = (
+                            f"<figcaption>{html_lib.escape(caption_text)}</figcaption>"
+                            if caption_text else ""
+                        )
+                        body_md_parts.append(
+                            f'<figure class="image"><img src="{html_lib.escape(src, quote=True)}" alt="{alt}" />{caption_html}</figure>'
+                        )
                 continue
 
             if name == "img":
+                # Standalone image only; images inside <figure> are handled above.
+                if el.find_parent("figure"):
+                    continue
                 src = _img_resolved_url(el, base_url)
-                if src and src not in seen_images:
-                    seen_images.add(src)
+                if src:
                     alt = (el.get("alt") or "").strip()
                     body_md_parts.append(f"![{alt}]({src})")
                 continue
@@ -528,6 +591,9 @@ def _crawl(
             # 3. inline images in text_markdown  (![alt](url) patterns)
             if text_markdown:
                 text_markdown = _rewrite_markdown_images(
+                    text_markdown, media_date, base_url=final_url
+                )
+                text_markdown = _rewrite_html_image_sources(
                     text_markdown, media_date, base_url=final_url
                 )
 
