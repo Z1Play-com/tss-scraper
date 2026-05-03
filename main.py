@@ -437,6 +437,7 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
         or soup.find(class_="editor-content")
         or soup.find(class_="fck_detail")
         or soup.find(class_="entry-content")
+        or soup.find(class_="entry-body")  # techz.vn and similar themes
         or soup.find(class_="post-content")
         or soup.find(class_="content-wrapper")  # VTC outer prose (fallback if no edittor)
     )
@@ -513,6 +514,65 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
     return text, text_markdown
 
 
+def _normalize_compare_text(s: str) -> str:
+    """Collapse whitespace and common ellipsis variants for duplicate detection."""
+    t = (s or "").replace("\u2026", "...").replace("…", "...")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _strip_outer_markdown_emphasis(text_block: str) -> str:
+    """Remove wrapping bold/italic markers from a markdown block for plain comparison."""
+    t = (text_block or "").strip()
+    while True:
+        prev = t
+        if len(t) > 4 and t.startswith("**") and t.endswith("**"):
+            t = t[2:-2].strip()
+        elif len(t) > 2 and t.startswith("*") and t.endswith("*") and not t.startswith("**"):
+            t = t[1:-1].strip()
+        elif len(t) > 2 and t.startswith("_") and t.endswith("_"):
+            t = t[1:-1].strip()
+        else:
+            break
+        if t == prev:
+            break
+    return t.replace("*", "").strip()
+
+
+def _strip_lead_duplicate_vs_meta(body: str, meta: Optional[str]) -> str:
+    """Drop leading blocks that repeat ``meta`` (og:description / meta description).
+
+    Sites like techz.vn echo the sapo in meta tags and again as the first bold
+    paragraph(s) in the article body. Downstream UIs already show ``description``
+    separately, so body text/markdown should not repeat it.
+    """
+    raw = (body or "").strip()
+    if not raw or not meta:
+        return body or ""
+    meta_n = _normalize_compare_text(meta)
+    if len(meta_n) < 40:
+        return body or ""
+    blocks = [b.strip() for b in re.split(r"\n\n+", raw) if b.strip()]
+    if not blocks:
+        return body or ""
+    i = 0
+    while i < len(blocks):
+        block_plain = _normalize_compare_text(_strip_outer_markdown_emphasis(blocks[i]))
+        if not block_plain:
+            i += 1
+            continue
+        if block_plain == meta_n:
+            i += 1
+            continue
+        # Shorter bold sub-headline fully contained in meta (common on techz.vn)
+        if len(block_plain) >= 25 and block_plain in meta_n:
+            i += 1
+            continue
+        break
+    if i == 0:
+        return body or ""
+    return "\n\n".join(blocks[i:]).strip()
+
+
 def _crawl(
     url: str,
     language: Optional[str] = None,
@@ -564,6 +624,12 @@ def _crawl(
         elif not text_markdown.strip() and bs_md.strip():
             # newspaper often omits text_markdown entirely while HTML body matches our selectors
             text_markdown = bs_md
+
+        meta_desc = article.meta_description or ""
+        if meta_desc:
+            text_markdown = _strip_lead_duplicate_vs_meta(text_markdown, meta_desc)
+            text = _strip_lead_duplicate_vs_meta(text, meta_desc)
+
         images = list(article.images) if article.images else []
 
         # ── Media localisation ──────────────────────────────────────────────
