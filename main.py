@@ -10,15 +10,18 @@ import os
 import pathlib
 import re
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
-from requests.adapters import HTTPAdapter
 import urllib3
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from newspaper import Article
 from newspaper.configuration import Configuration
@@ -83,6 +86,55 @@ _VIDEO_EXTS = {".mp4", ".webm", ".ogv", ".mov", ".avi", ".m3u8"}
 # Regex to find markdown image references: ![alt](url)
 _MD_IMAGE_RE = re.compile(r'(!\[[^\]]*\])\(([^)\s]+)\)')
 _HTML_IMG_SRC_RE = re.compile(r'(<img\b[^>]*\bsrc=["\'])([^"\']+)(["\'])', re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Shared HTTP connection pool — reused across all requests and threads.
+# _media_session is for media-only downloads (GET, no cookie mutation).
+# ---------------------------------------------------------------------------
+_http_adapter = HTTPAdapter(
+    pool_connections=20,
+    pool_maxsize=50,
+    max_retries=Retry(total=0),  # explicit retry logic lives in callers
+)
+_media_session = requests.Session()
+_media_session.headers.update(_HEADERS)
+_media_session.mount("http://", _http_adapter)
+_media_session.mount("https://", _http_adapter)
+
+# ---------------------------------------------------------------------------
+# Article-URL heuristics — compiled once at module load, not per request.
+# ---------------------------------------------------------------------------
+_SRC_NON_ARTICLE = re.compile(
+    r"/(tag|tags|tu-khoa|label|labels"
+    r"|topic|topics|chu-de|chuyen-de"
+    r"|category|cat|danh-muc|chuyen-muc"
+    r"|author|authors|tac-gia|user|profile"
+    r"|search|tim-kiem|keyword"
+    r"|page|trang"
+    r"|epaper|e-paper|bao-in|archive|luu-tru"
+    r"|gallery|video|photo|anh|infographic"
+    r"|rss|feed|amp)"
+    r"(/|$|\?|#)",
+    re.IGNORECASE,
+)
+_SRC_ASSET_EXT = re.compile(
+    r"\.(css|js|png|jpg|jpeg|gif|webp|svg|ico|pdf|zip|tar|gz|xml|json|rss|atom)(\?|$)",
+    re.IGNORECASE,
+)
+_SRC_ARTICLE_ID = re.compile(r"\d{4,}")
+_SRC_ARTICLE_SIGNAL = re.compile(
+    r"(post\d+|\d{6,}\.html?|\d{6,}\.tpo|\d{5,}\.ldo|\d{4}/\d{2}/\d{2})",
+    re.IGNORECASE,
+)
+_SRC_HEX_SUFFIX = re.compile(r"-[0-9a-f]{8,}(\.html?|\.tpo)?$", re.IGNORECASE)
+_SRC_FILE_EXT = re.compile(r"\.(html?|tpo|aspx|ldo)$", re.IGNORECASE)
+
+
+def _registered_domain(netloc: str) -> str:
+    """Return the last two dot-separated labels (handles .co.uk etc. roughly)."""
+    host = netloc.lower().lstrip("www.")
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
 
 def _img_resolved_url(img_tag, base_url: str) -> str | None:
@@ -154,20 +206,7 @@ def _guess_ext(url: str, content_type: str | None) -> str:
     return ".bin"
 
 
-def _make_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update(_HEADERS)
-    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=40, max_retries=0)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-
-def _download_media(
-    media_url: str,
-    ref_date: datetime | None = None,
-    session: requests.Session | None = None,
-) -> str | None:
+def _download_media(media_url: str, ref_date: datetime | None = None) -> str | None:
     """Download *media_url* to local storage and return its CDN URL.
 
     Files are stored under ``_MEDIA_DIR/{year-month}/{day}/`` and
@@ -183,9 +222,8 @@ def _download_media(
         dest_dir = _MEDIA_DIR / subdir
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        # Probe the file first to determine extension and size before writing.
-        session = session or _make_session()
-        resp = session.get(
+        # Probe the file first; reuse the shared session for TCP connection pooling.
+        resp = _media_session.get(
             media_url,
             timeout=_REQUEST_TIMEOUT,
             allow_redirects=True,
@@ -233,7 +271,7 @@ def _rewrite_markdown_images(
     text_markdown: str,
     ref_date: datetime | None = None,
     base_url: str = "",
-    session: requests.Session | None = None,
+    url_cache: dict | None = None,
 ) -> str:
     """Replace external image URLs in markdown ``![alt](url)`` with CDN URLs."""
     def _abs_url(u: str) -> str:
@@ -251,7 +289,7 @@ def _rewrite_markdown_images(
         img_url = _abs_url(m.group(2))
         if not img_url.startswith(("http://", "https://")):
             return m.group(0)
-        local_url = _download_media(img_url, ref_date, session=session)
+        local_url = url_cache.get(img_url) if url_cache is not None else _download_media(img_url, ref_date)
         if local_url:
             return f"{prefix}({local_url})"
         return m.group(0)
@@ -263,7 +301,7 @@ def _rewrite_html_image_sources(
     text_markdown: str,
     ref_date: datetime | None = None,
     base_url: str = "",
-    session: requests.Session | None = None,
+    url_cache: dict | None = None,
 ) -> str:
     """Replace external image URLs in raw HTML <img src="..."> blocks with CDN URLs."""
     def _abs_url(u: str) -> str:
@@ -281,7 +319,7 @@ def _rewrite_html_image_sources(
         abs_url = _abs_url(img_url)
         if not abs_url.startswith(("http://", "https://")):
             return m.group(0)
-        local_url = _download_media(abs_url, ref_date, session=session)
+        local_url = url_cache.get(abs_url) if url_cache is not None else _download_media(abs_url, ref_date)
         if local_url:
             return f"{prefix}{local_url}{quote}"
         return m.group(0)
@@ -289,7 +327,7 @@ def _rewrite_html_image_sources(
     return _HTML_IMG_SRC_RE.sub(_replace, text_markdown)
 
 
-def _fetch_html(url: str, session: requests.Session | None = None) -> tuple[str, str]:
+def _fetch_html(url: str) -> tuple[str, str]:
     """Download HTML via requests with browser UA.
 
     Handles:
@@ -298,7 +336,11 @@ def _fetch_html(url: str, session: requests.Session | None = None) -> tuple[str,
 
     Returns (html_text, final_url_after_redirects).
     """
-    session = session or _make_session()
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+    # Mount the shared adapter for TCP reuse; cookie state stays isolated per request.
+    session.mount("http://", _http_adapter)
+    session.mount("https://", _http_adapter)
 
     def _do_get(target: str, **kwargs) -> requests.Response:
         try:
@@ -393,13 +435,12 @@ def crawl_post(body: CrawlRequest):
     )
 
 
-def _extract_movies_from_html(html: str) -> list[str]:
+def _extract_movies_from_html(html: str, _soup: BeautifulSoup | None = None) -> list[str]:
     """Extract video URLs from <video src> and <source type="video/*"> tags.
 
     Newspaper does not parse HTML5 <video> elements — this supplements it.
     """
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
+    soup = _soup if _soup is not None else BeautifulSoup(html, "html.parser")
     seen: set[str] = set()
     urls: list[str] = []
     # <video src="..."> direct
@@ -418,7 +459,7 @@ def _extract_movies_from_html(html: str) -> list[str]:
     return urls
 
 
-def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
+def _extract_text_from_html(html: str, base_url: str = "", _soup: BeautifulSoup | None = None) -> tuple[str, str]:
     """Extract (text, text_markdown) from article HTML using BS4.
 
     Targets the primary article body selectors used by laodong.vn:
@@ -431,8 +472,7 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
     *base_url* is the article page URL; used to absolutize relative / protocol-relative
     image URLs so markdown and downstream media download work.
     """
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
+    soup = _soup if _soup is not None else BeautifulSoup(html, "html.parser")
 
     parts: list[str] = []
 
@@ -451,7 +491,6 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
         or soup.find(class_="editor-content")
         or soup.find(class_="fck_detail")
         or soup.find(class_="entry-content")
-        or soup.find(class_="entry-body")  # techz.vn and similar themes
         or soup.find(class_="post-content")
         or soup.find(class_="content-wrapper")  # VTC outer prose (fallback if no edittor)
     )
@@ -528,65 +567,6 @@ def _extract_text_from_html(html: str, base_url: str = "") -> tuple[str, str]:
     return text, text_markdown
 
 
-def _normalize_compare_text(s: str) -> str:
-    """Collapse whitespace and common ellipsis variants for duplicate detection."""
-    t = (s or "").replace("\u2026", "...").replace("…", "...")
-    return re.sub(r"\s+", " ", t).strip()
-
-
-def _strip_outer_markdown_emphasis(text_block: str) -> str:
-    """Remove wrapping bold/italic markers from a markdown block for plain comparison."""
-    t = (text_block or "").strip()
-    while True:
-        prev = t
-        if len(t) > 4 and t.startswith("**") and t.endswith("**"):
-            t = t[2:-2].strip()
-        elif len(t) > 2 and t.startswith("*") and t.endswith("*") and not t.startswith("**"):
-            t = t[1:-1].strip()
-        elif len(t) > 2 and t.startswith("_") and t.endswith("_"):
-            t = t[1:-1].strip()
-        else:
-            break
-        if t == prev:
-            break
-    return t.replace("*", "").strip()
-
-
-def _strip_lead_duplicate_vs_meta(body: str, meta: Optional[str]) -> str:
-    """Drop leading blocks that repeat ``meta`` (og:description / meta description).
-
-    Sites like techz.vn echo the sapo in meta tags and again as the first bold
-    paragraph(s) in the article body. Downstream UIs already show ``description``
-    separately, so body text/markdown should not repeat it.
-    """
-    raw = (body or "").strip()
-    if not raw or not meta:
-        return body or ""
-    meta_n = _normalize_compare_text(meta)
-    if len(meta_n) < 40:
-        return body or ""
-    blocks = [b.strip() for b in re.split(r"\n\n+", raw) if b.strip()]
-    if not blocks:
-        return body or ""
-    i = 0
-    while i < len(blocks):
-        block_plain = _normalize_compare_text(_strip_outer_markdown_emphasis(blocks[i]))
-        if not block_plain:
-            i += 1
-            continue
-        if block_plain == meta_n:
-            i += 1
-            continue
-        # Shorter bold sub-headline fully contained in meta (common on techz.vn)
-        if len(block_plain) >= 25 and block_plain in meta_n:
-            i += 1
-            continue
-        break
-    if i == 0:
-        return body or ""
-    return "\n\n".join(blocks[i:]).strip()
-
-
 def _crawl(
     url: str,
     language: Optional[str] = None,
@@ -596,18 +576,17 @@ def _crawl(
 ) -> ArticleResponse:
     try:
         config = Configuration()
-        config.request_timeout = _REQUEST_TIMEOUT
-        config.fetch_images = False
         if language:
             config.language = language
         config.follow_meta_refresh = follow_meta_refresh
         config.keep_article_html = keep_article_html
 
-        session = _make_session()
-        html, final_url = _fetch_html(url, session=session)
+        html, final_url = _fetch_html(url)
         article = Article(final_url, config=config)
         article.download(input_html=html)
         article.parse()
+        # Parse HTML once and share the soup object to avoid redundant parsing.
+        _soup = BeautifulSoup(html, "html.parser")
 
         publish_date = (
             article.publish_date.isoformat() if article.publish_date else None
@@ -624,13 +603,13 @@ def _crawl(
         # movies: newspaper misses HTML5 <video>/<source> elements — supplement via BS4
         movies = article.movies or []
         if not movies:
-            movies = _extract_movies_from_html(html)
+            movies = _extract_movies_from_html(html, _soup=_soup)
 
         # text / text_markdown: for video pages (or whenever newspaper returns poor text),
         # fall back to BS4 extraction of .chappeau + article body.
         text = article.text or ""
         text_markdown = article.text_markdown or ""
-        bs_text, bs_md = _extract_text_from_html(html, final_url)
+        bs_text, bs_md = _extract_text_from_html(html, final_url, _soup=_soup)
         if article.article_type == "video" or not text.strip():
             if bs_text:
                 text = bs_text
@@ -641,12 +620,6 @@ def _crawl(
         elif not text_markdown.strip() and bs_md.strip():
             # newspaper often omits text_markdown entirely while HTML body matches our selectors
             text_markdown = bs_md
-
-        meta_desc = article.meta_description or ""
-        if meta_desc:
-            text_markdown = _strip_lead_duplicate_vs_meta(text_markdown, meta_desc)
-            text = _strip_lead_duplicate_vs_meta(text, meta_desc)
-
         images = list(article.images) if article.images else []
 
         # ── Media localisation ──────────────────────────────────────────────
@@ -655,40 +628,62 @@ def _crawl(
             # Fall back to current date when publish_date is unavailable.
             media_date = article.publish_date or datetime.now()
 
-            # 1. top_image
+            # Collect every unique HTTP(S) URL to download in a single parallel pass.
+            _to_download: set[str] = set()
             if top_image and top_image.startswith(("http://", "https://")):
-                local = _download_media(top_image, media_date, session=session)
-                if local:
-                    top_image = local
+                _to_download.add(top_image)
+            for _mv in movies:
+                if _mv.startswith(("http://", "https://")):
+                    _to_download.add(_mv)
+            for _img in images:
+                if _img.startswith(("http://", "https://")):
+                    _to_download.add(_img)
+            if text_markdown:
+                def _abs_md(u: str) -> str:
+                    u = u.strip()
+                    if u.startswith("//"): return "https:" + u
+                    if u.startswith(("http://", "https://")): return u
+                    return urljoin(final_url, u) if final_url else u
+                for _m in _MD_IMAGE_RE.finditer(text_markdown):
+                    _u = _abs_md(_m.group(2))
+                    if _u.startswith(("http://", "https://")): _to_download.add(_u)
+                for _m in _HTML_IMG_SRC_RE.finditer(text_markdown):
+                    _u = _abs_md(_m.group(2))
+                    if _u.startswith(("http://", "https://")): _to_download.add(_u)
+
+            # Download all assets concurrently — each is independent I/O.
+            url_cache: dict[str, str | None] = {}
+            if _to_download:
+                _workers = min(len(_to_download), int(os.environ.get("MEDIA_WORKERS", "8")))
+                with ThreadPoolExecutor(max_workers=_workers) as _ex:
+                    _futs = {_ex.submit(_download_media, _u, media_date): _u for _u in _to_download}
+                    for _f in as_completed(_futs):
+                        url_cache[_futs[_f]] = _f.result()
+
+            # 1. top_image
+            if top_image and url_cache.get(top_image):
+                top_image = url_cache[top_image]
 
             # 2. movies (videos)
-            local_movies: list[str] = []
-            for mv in movies:
-                if mv.startswith(("http://", "https://")):
-                    local = _download_media(mv, media_date, session=session)
-                    local_movies.append(local if local else mv)
-                else:
-                    local_movies.append(mv)
-            movies = local_movies
+            movies = [
+                (url_cache.get(mv) or mv) if mv.startswith(("http://", "https://")) else mv
+                for mv in movies
+            ]
 
             # 3. inline images in text_markdown  (![alt](url) patterns)
             if text_markdown:
                 text_markdown = _rewrite_markdown_images(
-                    text_markdown, media_date, base_url=final_url, session=session
+                    text_markdown, media_date, base_url=final_url, url_cache=url_cache
                 )
                 text_markdown = _rewrite_html_image_sources(
-                    text_markdown, media_date, base_url=final_url, session=session
+                    text_markdown, media_date, base_url=final_url, url_cache=url_cache
                 )
 
             # 4. images list (all images referenced in the article)
-            local_images: list[str] = []
-            for img in images:
-                if img.startswith(("http://", "https://")):
-                    local = _download_media(img, media_date, session=session)
-                    local_images.append(local if local else img)
-                else:
-                    local_images.append(img)
-            images = local_images
+            images = [
+                (url_cache.get(img) or img) if img.startswith(("http://", "https://")) else img
+                for img in images
+            ]
 
         return ArticleResponse(
             url=article.url,
@@ -740,48 +735,7 @@ def scrape_source(
     - NOT matched by known non-article path segments (tag, topic, danh-muc, …)
     - NOT a static-asset extension
     """
-    from bs4 import BeautifulSoup
-    from urllib.parse import urljoin, urlparse
-
-    # ── Heuristic helpers ──────────────────────────────────────────────────
-
-    # Regex: path segments that indicate category / tag / topic / author / archive pages
-    _NON_ARTICLE = re.compile(
-        r"/(tag|tags|tu-khoa|label|labels"
-        r"|topic|topics|chu-de|chuyen-de"
-        r"|category|cat|danh-muc|chuyen-muc"
-        r"|author|authors|tac-gia|user|profile"
-        r"|search|tim-kiem|keyword"
-        r"|page|trang"
-        r"|epaper|e-paper|bao-in|archive|luu-tru"
-        r"|gallery|video|photo|anh|infographic"
-        r"|rss|feed|amp)"
-        r"(/|$|\?|#)",
-        re.IGNORECASE,
-    )
-    # Static-asset extensions to skip
-    _ASSET_EXT = re.compile(
-        r"\.(css|js|png|jpg|jpeg|gif|webp|svg|ico|pdf|zip|tar|gz|xml|json|rss|atom)(\?|$)",
-        re.IGNORECASE,
-    )
-    # Article ID signal: ≥4 consecutive digits (covers years 2020… and IDs like 1234567)
-    _ARTICLE_ID = re.compile(r"\d{4,}")
-    # Common article URL signals beyond numeric ID
-    # .ldo = laodong.vn article extension
-    _ARTICLE_SIGNAL = re.compile(
-        r"(post\d+|\d{6,}\.html?|\d{6,}\.tpo|\d{5,}\.ldo|\d{4}/\d{2}/\d{2})",
-        re.IGNORECASE,
-    )
-    # Hex-based article ID suffix: slug-XXXXXXXX.html (e.g. baophapluat.vn, eva.vn)
-    _HEX_SUFFIX = re.compile(r"-[0-9a-f]{8,}(\.html?|\.tpo)?$", re.IGNORECASE)
-    # File-extension hint that suggests a concrete document (not a directory/category)
-    _FILE_EXT = re.compile(r"\.(html?|tpo|aspx|ldo)$", re.IGNORECASE)
-
-    def _registered_domain(netloc: str) -> str:
-        """Return the last two dot-separated labels (handles .co.uk etc. roughly)."""
-        host = netloc.lower().lstrip("www.")
-        parts = host.split(".")
-        return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    # ── Heuristic helpers (regexes and _registered_domain are module-level) ──
 
     def is_article_url(candidate: str, base_reg_domain: str) -> bool:
         try:
@@ -798,22 +752,22 @@ def scrape_source(
         # Must be at least 2 path levels deep (e.g. /rubric/article, not /the-thao)
         if path.count("/") < 1 or len(path) < 10:
             return False
-        if _ASSET_EXT.search(path):
+        if _SRC_ASSET_EXT.search(path):
             return False
-        if _NON_ARTICLE.search(path):
+        if _SRC_NON_ARTICLE.search(path):
             return False
         # ── Tier 1: strong explicit article signals (any depth) ──────────
         # post12345, 6-digit id.html, date path, hex suffix like slug-a1b2c3d4.html
-        if _ARTICLE_SIGNAL.search(path) or _HEX_SUFFIX.search(path):
+        if _SRC_ARTICLE_SIGNAL.search(path) or _SRC_HEX_SUFFIX.search(path):
             return True
         # ── Tier 2: file-extension URL with long slug (depth ≥ 1) ────────
         # Covers sites like baophapluat.vn where articles live at /slug.html
         # (no numeric ID). Require path ≥ 30 chars to exclude short section pages
         # like /the-thao.html or /van-hoa.html.
-        if _FILE_EXT.search(path) and len(path) >= 30:
+        if _SRC_FILE_EXT.search(path) and len(path) >= 30:
             return True
         # ── Tier 3: depth ≥ 2 with 4+ digit ID ──────────────────────────
-        if path.count("/") >= 2 and _ARTICLE_ID.search(path):
+        if path.count("/") >= 2 and _SRC_ARTICLE_ID.search(path):
             return True
         return False
 
@@ -822,8 +776,6 @@ def scrape_source(
         config = Configuration()
         config.browser_user_agent = _BROWSER_UA
         config.headers = _HEADERS
-        config.request_timeout = _REQUEST_TIMEOUT
-        config.fetch_images = False
         if language:
             config.language = language
         config.memoize_articles = False  # avoid stale cache across calls
@@ -894,12 +846,7 @@ def scrape_source(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=os.environ.get("SCRAPER_RELOAD", "0") == "1",
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
 
 @app.get("/popular", summary="Danh sách các nguồn tin phổ biến")
@@ -997,14 +944,16 @@ def hot_trends(
     if category == "all":
         seen: set[str] = set()
         merged: list[dict] = []
-        for cat_name in _TREND_CATEGORIES:
-            if cat_name == "all":
-                continue
-            for trend in _fetch_trends(geo=geo, hl=hl, category=cat_name):
-                key = (trend["keyword"] or "").lower()
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(trend)
+        # Fetch all categories in parallel — each is an independent HTTP request.
+        _cats = [c for c in _TREND_CATEGORIES if c != "all"]
+        with ThreadPoolExecutor(max_workers=len(_cats)) as _ex:
+            _futs = {_ex.submit(_fetch_trends, geo=geo, hl=hl, category=c): c for c in _cats}
+            for _f in as_completed(_futs):
+                for trend in _f.result():
+                    key = (trend["keyword"] or "").lower()
+                    if key not in seen:
+                        seen.add(key)
+                        merged.append(trend)
         # Sort by traffic descending (e.g. "500+" > "200+" > "100+")
         def _traffic_val(t: dict) -> int:
             tr = t.get("traffic") or "0"
