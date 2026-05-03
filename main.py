@@ -15,6 +15,7 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 import urllib3
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl
@@ -153,7 +154,20 @@ def _guess_ext(url: str, content_type: str | None) -> str:
     return ".bin"
 
 
-def _download_media(media_url: str, ref_date: datetime | None = None) -> str | None:
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=40, max_retries=0)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def _download_media(
+    media_url: str,
+    ref_date: datetime | None = None,
+    session: requests.Session | None = None,
+) -> str | None:
     """Download *media_url* to local storage and return its CDN URL.
 
     Files are stored under ``_MEDIA_DIR/{year-month}/{day}/`` and
@@ -170,8 +184,7 @@ def _download_media(media_url: str, ref_date: datetime | None = None) -> str | N
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # Probe the file first to determine extension and size before writing.
-        session = requests.Session()
-        session.headers.update(_HEADERS)
+        session = session or _make_session()
         resp = session.get(
             media_url,
             timeout=_REQUEST_TIMEOUT,
@@ -220,6 +233,7 @@ def _rewrite_markdown_images(
     text_markdown: str,
     ref_date: datetime | None = None,
     base_url: str = "",
+    session: requests.Session | None = None,
 ) -> str:
     """Replace external image URLs in markdown ``![alt](url)`` with CDN URLs."""
     def _abs_url(u: str) -> str:
@@ -237,7 +251,7 @@ def _rewrite_markdown_images(
         img_url = _abs_url(m.group(2))
         if not img_url.startswith(("http://", "https://")):
             return m.group(0)
-        local_url = _download_media(img_url, ref_date)
+        local_url = _download_media(img_url, ref_date, session=session)
         if local_url:
             return f"{prefix}({local_url})"
         return m.group(0)
@@ -249,6 +263,7 @@ def _rewrite_html_image_sources(
     text_markdown: str,
     ref_date: datetime | None = None,
     base_url: str = "",
+    session: requests.Session | None = None,
 ) -> str:
     """Replace external image URLs in raw HTML <img src="..."> blocks with CDN URLs."""
     def _abs_url(u: str) -> str:
@@ -266,7 +281,7 @@ def _rewrite_html_image_sources(
         abs_url = _abs_url(img_url)
         if not abs_url.startswith(("http://", "https://")):
             return m.group(0)
-        local_url = _download_media(abs_url, ref_date)
+        local_url = _download_media(abs_url, ref_date, session=session)
         if local_url:
             return f"{prefix}{local_url}{quote}"
         return m.group(0)
@@ -274,7 +289,7 @@ def _rewrite_html_image_sources(
     return _HTML_IMG_SRC_RE.sub(_replace, text_markdown)
 
 
-def _fetch_html(url: str) -> tuple[str, str]:
+def _fetch_html(url: str, session: requests.Session | None = None) -> tuple[str, str]:
     """Download HTML via requests with browser UA.
 
     Handles:
@@ -283,8 +298,7 @@ def _fetch_html(url: str) -> tuple[str, str]:
 
     Returns (html_text, final_url_after_redirects).
     """
-    session = requests.Session()
-    session.headers.update(_HEADERS)
+    session = session or _make_session()
 
     def _do_get(target: str, **kwargs) -> requests.Response:
         try:
@@ -582,12 +596,15 @@ def _crawl(
 ) -> ArticleResponse:
     try:
         config = Configuration()
+        config.request_timeout = _REQUEST_TIMEOUT
+        config.fetch_images = False
         if language:
             config.language = language
         config.follow_meta_refresh = follow_meta_refresh
         config.keep_article_html = keep_article_html
 
-        html, final_url = _fetch_html(url)
+        session = _make_session()
+        html, final_url = _fetch_html(url, session=session)
         article = Article(final_url, config=config)
         article.download(input_html=html)
         article.parse()
@@ -640,7 +657,7 @@ def _crawl(
 
             # 1. top_image
             if top_image and top_image.startswith(("http://", "https://")):
-                local = _download_media(top_image, media_date)
+                local = _download_media(top_image, media_date, session=session)
                 if local:
                     top_image = local
 
@@ -648,7 +665,7 @@ def _crawl(
             local_movies: list[str] = []
             for mv in movies:
                 if mv.startswith(("http://", "https://")):
-                    local = _download_media(mv, media_date)
+                    local = _download_media(mv, media_date, session=session)
                     local_movies.append(local if local else mv)
                 else:
                     local_movies.append(mv)
@@ -657,17 +674,17 @@ def _crawl(
             # 3. inline images in text_markdown  (![alt](url) patterns)
             if text_markdown:
                 text_markdown = _rewrite_markdown_images(
-                    text_markdown, media_date, base_url=final_url
+                    text_markdown, media_date, base_url=final_url, session=session
                 )
                 text_markdown = _rewrite_html_image_sources(
-                    text_markdown, media_date, base_url=final_url
+                    text_markdown, media_date, base_url=final_url, session=session
                 )
 
             # 4. images list (all images referenced in the article)
             local_images: list[str] = []
             for img in images:
                 if img.startswith(("http://", "https://")):
-                    local = _download_media(img, media_date)
+                    local = _download_media(img, media_date, session=session)
                     local_images.append(local if local else img)
                 else:
                     local_images.append(img)
@@ -805,6 +822,8 @@ def scrape_source(
         config = Configuration()
         config.browser_user_agent = _BROWSER_UA
         config.headers = _HEADERS
+        config.request_timeout = _REQUEST_TIMEOUT
+        config.fetch_images = False
         if language:
             config.language = language
         config.memoize_articles = False  # avoid stale cache across calls
@@ -875,7 +894,12 @@ def scrape_source(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=os.environ.get("SCRAPER_RELOAD", "0") == "1",
+    )
 
 
 @app.get("/popular", summary="Danh sách các nguồn tin phổ biến")
