@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin, urlparse
+import threading
+import time
 
 import requests
 import urllib3
@@ -21,6 +23,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl
 from requests.adapters import HTTPAdapter
+from starlette.concurrency import run_in_threadpool
 from urllib3.util.retry import Retry
 
 from newspaper import Article
@@ -128,6 +131,8 @@ _SRC_ARTICLE_SIGNAL = re.compile(
 )
 _SRC_HEX_SUFFIX = re.compile(r"-[0-9a-f]{8,}(\.html?|\.tpo)?$", re.IGNORECASE)
 _SRC_FILE_EXT = re.compile(r"\.(html?|tpo|aspx|ldo)$", re.IGNORECASE)
+# Regex to strip noisy sidebar/related blocks inside article body.
+_NOISE_CLASS_RE = re.compile(r"related|sidebar|footer|widget|ad|social|comment", re.I)
 
 
 def _registered_domain(netloc: str) -> str:
@@ -374,6 +379,56 @@ def _fetch_html(url: str) -> tuple[str, str]:
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Per-worker response cache with TTL — avoids re-crawling the same URL.
+# Each uvicorn worker process has its own cache (no shared state needed).
+# Set CRAWL_CACHE_TTL=0 to disable.
+# ---------------------------------------------------------------------------
+_CRAWL_CACHE_TTL = int(os.environ.get("CRAWL_CACHE_TTL", "300"))  # seconds
+_crawl_cache: dict[str, tuple[float, ArticleResponse]] = {}
+_crawl_cache_lock = threading.Lock()
+
+# Semaphore: max concurrent heavy crawl operations across all threads in this worker.
+# Prevents request pileup when upstream sites are slow.
+# Tune via CRAWL_CONCURRENCY env var (default 2 per worker).
+_CRAWL_CONCURRENCY = int(os.environ.get("CRAWL_CONCURRENCY", "2"))
+_crawl_sem: threading.Semaphore = threading.Semaphore(_CRAWL_CONCURRENCY)
+
+
+def _crawl_cached(
+    url: str,
+    language: Optional[str] = None,
+    follow_meta_refresh: bool = False,
+    keep_article_html: bool = False,
+    download_media: bool = False,
+) -> ArticleResponse:
+    if not _CRAWL_CACHE_TTL or download_media:
+        with _crawl_sem:
+            return _crawl(url, language=language, follow_meta_refresh=follow_meta_refresh,
+                          keep_article_html=keep_article_html, download_media=download_media)
+    cache_key = f"{url}|{language}|{follow_meta_refresh}|{keep_article_html}"
+    now = time.monotonic()
+    with _crawl_cache_lock:
+        entry = _crawl_cache.get(cache_key)
+        if entry and now - entry[0] < _CRAWL_CACHE_TTL:
+            log.debug("Cache hit: %s", url)
+            return entry[1]
+    with _crawl_sem:
+        # Re-check cache after acquiring semaphore (another thread may have just computed it).
+        with _crawl_cache_lock:
+            entry = _crawl_cache.get(cache_key)
+            if entry and now - entry[0] < _CRAWL_CACHE_TTL:
+                return entry[1]
+        result = _crawl(url, language=language, follow_meta_refresh=follow_meta_refresh,
+                        keep_article_html=keep_article_html, download_media=download_media)
+    with _crawl_cache_lock:
+        _crawl_cache[cache_key] = (time.monotonic(), result)
+        # Prune expired entries to prevent unbounded growth.
+        expired = [k for k, (ts, _) in _crawl_cache.items() if time.monotonic() - ts >= _CRAWL_CACHE_TTL]
+        for k in expired:
+            del _crawl_cache[k]
+    return result
+
 app = FastAPI(
     title="Article Crawler API",
     description="Crawl and extract article content from any URL using newspaper4k",
@@ -413,20 +468,23 @@ def health_check():
 
 
 @app.get("/crawl", response_model=ArticleResponse, summary="Crawl article from URL")
-def crawl_get(
+async def crawl_get(
     url: str = Query(..., description="URL of the article to crawl"),
     language: Optional[str] = Query(None, description="Language code, e.g. 'en', 'vi', 'zh'"),
     follow_meta_refresh: bool = Query(False, description="Follow meta refresh redirects"),
     download_media: bool = Query(False, description="Download media to local CDN and rewrite URLs"),
 ):
     """Crawl and extract article content from the given URL (GET)."""
-    return _crawl(url, language=language, follow_meta_refresh=follow_meta_refresh, download_media=download_media)
+    return await run_in_threadpool(_crawl_cached, url, language=language,
+                                   follow_meta_refresh=follow_meta_refresh,
+                                   download_media=download_media)
 
 
 @app.post("/crawl", response_model=ArticleResponse, summary="Crawl article from URL")
-def crawl_post(body: CrawlRequest):
+async def crawl_post(body: CrawlRequest):
     """Crawl and extract article content from the given URL (POST)."""
-    return _crawl(
+    return await run_in_threadpool(
+        _crawl_cached,
         str(body.url),
         language=body.language,
         follow_meta_refresh=body.follow_meta_refresh,
@@ -440,7 +498,7 @@ def _extract_movies_from_html(html: str, _soup: BeautifulSoup | None = None) -> 
 
     Newspaper does not parse HTML5 <video> elements — this supplements it.
     """
-    soup = _soup if _soup is not None else BeautifulSoup(html, "html.parser")
+    soup = _soup if _soup is not None else BeautifulSoup(html, "lxml")
     seen: set[str] = set()
     urls: list[str] = []
     # <video src="..."> direct
@@ -472,7 +530,7 @@ def _extract_text_from_html(html: str, base_url: str = "", _soup: BeautifulSoup 
     *base_url* is the article page URL; used to absolutize relative / protocol-relative
     image URLs so markdown and downstream media download work.
     """
-    soup = _soup if _soup is not None else BeautifulSoup(html, "html.parser")
+    soup = _soup if _soup is not None else BeautifulSoup(html, "lxml")
 
     parts: list[str] = []
 
@@ -496,7 +554,7 @@ def _extract_text_from_html(html: str, base_url: str = "", _soup: BeautifulSoup 
     )
     if body:
         # Remove sidebar / related / footer elements inside body
-        for noise in body.find_all(class_=re.compile(r"related|sidebar|footer|widget|ad|social|comment", re.I)):
+        for noise in body.find_all(class_=_NOISE_CLASS_RE):
             noise.decompose()
         body_text = body.get_text(" ", strip=True)
         if body_text:
@@ -580,13 +638,21 @@ def _crawl(
             config.language = language
         config.follow_meta_refresh = follow_meta_refresh
         config.keep_article_html = keep_article_html
+        config.fetch_images = False      # we handle image URLs ourselves; skip internal download
+        config.memoize_articles = False  # prevent stale in-process cache
 
         html, final_url = _fetch_html(url)
         article = Article(final_url, config=config)
         article.download(input_html=html)
         article.parse()
-        # Parse HTML once and share the soup object to avoid redundant parsing.
-        _soup = BeautifulSoup(html, "html.parser")
+        # _soup is created lazily — only when newspaper output is insufficient.
+        _soup: BeautifulSoup | None = None
+
+        def _get_soup() -> BeautifulSoup:
+            nonlocal _soup
+            if _soup is None:
+                _soup = BeautifulSoup(html, "lxml")
+            return _soup
 
         publish_date = (
             article.publish_date.isoformat() if article.publish_date else None
@@ -603,13 +669,22 @@ def _crawl(
         # movies: newspaper misses HTML5 <video>/<source> elements — supplement via BS4
         movies = article.movies or []
         if not movies:
-            movies = _extract_movies_from_html(html, _soup=_soup)
+            movies = _extract_movies_from_html(html, _soup=_get_soup())
 
-        # text / text_markdown: for video pages (or whenever newspaper returns poor text),
-        # fall back to BS4 extraction of .chappeau + article body.
+        # text / text_markdown: use newspaper output when it's good enough;
+        # only fall back to BS4 (which requires a second lxml parse) when needed.
         text = article.text or ""
         text_markdown = article.text_markdown or ""
-        bs_text, bs_md = _extract_text_from_html(html, final_url, _soup=_soup)
+        need_bs4 = (
+            article.article_type == "video"
+            or not text.strip()
+            or not text_markdown.strip()
+            or download_media
+        )
+        bs_text = bs_md = ""
+        if need_bs4:
+            bs_text, bs_md = _extract_text_from_html(html, final_url, _soup=_get_soup())
+
         if article.article_type == "video" or not text.strip():
             if bs_text:
                 text = bs_text
@@ -817,7 +892,7 @@ def scrape_source(
                 log.warning("_fetch_html fallback failed for %s: %s", url, e)
                 html = ""
         if html:
-            soup = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(html, "lxml")
             for tag in soup.find_all("a", href=True):
                 href = (tag.get("href") or "").strip()
                 if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
